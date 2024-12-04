@@ -1,5 +1,4 @@
 from pathlib import Path
-import os
 
 def list_files(directory_path, extensions=['*']):
     # https://stackoverflow.com/a/77259205

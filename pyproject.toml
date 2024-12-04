@@ -5,7 +5,6 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "dask>=2024.11.2",
     "distributed>=2024.11.2",
     "fiona>=1.10.1",
     "geopandas>=1.0.1",
@@ -21,4 +20,7 @@ dependencies = [
 [dependency-groups]
 optional = [
     "ipykernel>=6.29.5",
+]
+dev = [
+    "ruff>=0.8.1",
 ]
