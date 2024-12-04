@@ -5,13 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "dask>=2024.11.2",
+    "distributed>=2024.11.2",
     "fiona>=1.10.1",
     "geopandas>=1.0.1",
     "ipympl>=0.9.4",
     "matplotlib>=3.9.2",
     "pyproj>=3.7.0",
-    "rasterio[s3]>=1.4.2",
+    "rasterio[s3]==1.4.3",
+    "rio-cogeo>=5.4.0",
     "shapely>=2.0.6",
+    "tqdm>=4.67.1",
 ]
 
 [dependency-groups]
