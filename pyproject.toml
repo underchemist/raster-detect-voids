@@ -5,11 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "distributed>=2024.11.2",
     "fiona>=1.10.1",
     "geopandas>=1.0.1",
-    "ipympl>=0.9.4",
-    "matplotlib>=3.9.2",
     "pyproj>=3.7.0",
     "rasterio[s3]==1.4.3",
     "rio-cogeo>=5.4.0",
@@ -20,6 +17,8 @@ dependencies = [
 [dependency-groups]
 optional = [
     "ipykernel>=6.29.5",
+    "ipympl>=0.9.4",
+    "matplotlib>=3.9.3",
 ]
 dev = [
     "ruff>=0.8.1",

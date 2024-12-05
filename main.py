@@ -1,50 +1,31 @@
 import hashlib
 import logging
 import os
-import traceback
 import zlib
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Optional, TypedDict
+from typing import Any, Optional
 
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import rasterio
 import rasterio.mask
 import shapely
 import shapely.geometry
-import shapely.ops
 from rio_cogeo import cog_info
 from tqdm import tqdm
 
+from report import RasterProperties, dump_exceptions, write_failed, write_report
 from timing import timeit
 from walk import list_files
 
-logging.basicConfig(level=logging.INFO)
-
+# ignore logging from these modules, remove to see debug messages from all modules
+LOGGING_MODULE_IGNORE = ["rasterio", "pandas", "geopandas"]
 logger = logging.getLogger(__name__)
 
-
-class RasterProperties(TypedDict):
-    filename: str
-    filesize: int
-    hash: str
-    nodata: int | float
-    bands: int
-    compression: str
-    epsg: int
-    xres: float
-    yres: float
-    minval: int | float
-    maxval: int | float
-    has_voids: bool
-    void_ratio: float
-    nodata_internal: int
-    nodata_boundary: int
-    is_valid_cog: bool
-    cog_errors: str
-    cog_warnings: str
+logging.basicConfig(level=logging.INFO)
+for module in LOGGING_MODULE_IGNORE:
+    logging.getLogger(module).setLevel(logging.WARNING)
 
 
 def crc_checksum(file_path):
@@ -105,16 +86,21 @@ def get_void_mask(
     return void_mask
 
 
-def compute_void_ratio(void_mask: np.ndarray) -> float:
+def compute_void_ratio(void_mask: np.ndarray, raster_mask: np.ndarray) -> float:
     void_pixel_count = void_mask.sum()  # only True values are counted
-    total_pixel_count = void_mask.size
+    total_pixel_count = raster_mask.astype(
+        "bool"
+    ).sum()  # perhaps should be the count of masked raster pixels?
     void_ratio = void_pixel_count / total_pixel_count
 
     return void_ratio
 
 
 def contains_voids(
-    void_mask: np.ndarray, void_threshold: float = 0.01, strict: bool = False
+    void_mask: np.ndarray,
+    raster_mask: np.ndarray,
+    void_threshold: float = 0.01,
+    strict: bool = False,
 ) -> bool:
     """
     True if void mask array contains void pixels. False otherwise.
@@ -131,7 +117,7 @@ def contains_voids(
     if strict:
         return bool(void_mask.any())
 
-    void_ratio = compute_void_ratio(void_mask)
+    void_ratio = compute_void_ratio(void_mask, raster_mask)
     if void_ratio > void_threshold:
         return True
     return False
@@ -174,19 +160,44 @@ def get_raster_properties(
     raster_filename: str,
     boundary: gpd.GeoDataFrame,
     strict: bool = False,
-    void_threshold: float = 0.01,
+    void_threshold: float = 0.01,  # 1% void pixel threshold
     classify_voids: bool = False,
-    geom_buffer_size: float = 1,
+    geom_buffer_size: float = 1.0,
     env_options: Optional[dict[str, Any]] = None,
     rasterize_options: Optional[dict[str, Any]] = None,
 ) -> RasterProperties:
+    """
+    Compute raster properties for a given raster file and boundary geometry.
+
+    Args:
+        raster_filename (str): Filename for raster dataset.
+        boundary (gpd.GeoDataFrame): A vector dataset describing the data
+            collection Boundary, returned by geopandas.read_file.
+        strict (bool, optional): If True, voids will be detected in raster
+            if there is >=1 nodata pixel contained in the boundary geometry. Defaults to False.
+        void_threshold (float, optional): The ratio of detected void pixels
+            to the total number of pixels in a raster dataset. Raster datasets
+            that have a void pixel ratio above this value will be determined as
+            having "voids", less than will be determined to not have "voids". Defaults to 0.01.
+        classify_voids (bool, optional): If the raster dataset has voids,
+            attempt to classify the voids as either nodata_internal or nodata_boundary. Defaults to False.
+        geom_buffer_size (float, optional): Buffer the boundary exterior ring
+            geometry in pixel units. Only used to classify_voids. Defaults to 1.
+        env_options (Optional[dict[str, Any]], optional): Options to pass to rasterio.Env.
+            See DEFAULT_ENV_OPTIONS. Defaults to None.
+        rasterize_options (Optional[dict[str, Any]], optional): Options to pass to
+            rasterio.features.Rasterize. Defaults to None.
+
+    Returns:
+        RasterProperties: Mapping of raster properties
+    """
     if env_options is None:
         env_options = dict()
     if rasterize_options is None:
         rasterize_options = dict()
 
     raster_filename = Path(raster_filename)
-    hashval = md5_checksum(raster_filename)
+    hashval = md5_checksum(raster_filename)  # use your preferred hashing algorithm
     filesize = raster_filename.stat().st_size
     info = cog_info(raster_filename)
     nodata = info.Profile.Nodata
@@ -207,14 +218,22 @@ def get_raster_properties(
             boundary_geom = boundary.geometry
 
             epsg = src.crs.to_epsg()
+            # can pass approx=True to compute stats from overviews,
+            # I don't expect this to significatly impact performance however
             stats = src.stats(indexes=1)[0]
             minval = stats.min
             maxval = stats.max
+
+            # void computations
+            raster_mask = src.read_masks(1)
             void_arr = get_void_mask(src, boundary_geom, **rasterize_options)
             has_voids = contains_voids(
-                void_arr, void_threshold=void_threshold, strict=strict
+                void_arr,
+                raster_mask,
+                void_threshold=void_threshold,
+                strict=strict,
             )
-            void_ratio = compute_void_ratio(void_arr)
+            void_ratio = compute_void_ratio(void_arr, raster_mask)
             nodata_internal = 0
             nodata_boundary = 0
             if classify_voids and has_voids:
@@ -251,40 +270,46 @@ def get_raster_properties(
     )
 
 
-@timeit
-def main():
-    MAX_RETRY_FAILED_FUTURES = 3  # maximum number of retries for failed futures
-    MAX_WORKERS = (
-        os.cpu_count()
-    )  # numbers of workers to use for parallel processing, default is number of CPU cores.
-    DEFAULT_ENV_OPTIONS = {
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "GDAL_PAM_ENABLED": "NO",
-    }
-    MAX_ITEMS = 100  # short-circuit for testing
+def process_rasters(
+    flist: list[Path],
+    boundary_df: gpd.GeoDataFrame,
+    max_workers: int,
+    max_retries: int,
+    env_options: dict[str, Any],
+    void_options: dict[str, Any],
+) -> tuple[list[RasterProperties], list[Future], dict[Future, Any]]:
+    """
+    Wrapper function to process raster files in parallel using ProcessPoolExecutor.
 
-    data_root = Path("./data/17811_US_LP_2024_Enbridge_test")
-    boundary_file = next(data_root.rglob("*Boundary*.geojson"))
-    boundary_df = gpd.read_file(boundary_file)
-    flist = list_files(data_root, extensions=["tif", "tiff"])
-    if MAX_ITEMS:
-        flist = flist[:MAX_ITEMS]
+    Args:
+        flist (list[Path]): List of raster file paths.
+        boundary_df (gpd.GeoDataFrame): Vector dataset describing the data collection Boundary.
+        max_workers (int): Number of processes to use in ProcessPoolExecutor.
+        max_retries (int): Number of retries for failed get_raster_properties.
+        env_options (dict[str, Any]): Options to pass to rasterio.Env
+        void_options (dict[str, Any]): keyword arguments to pass to get_raster_properties
+
+    Returns:
+        tuple[list[RasterProperties], list[Future], dict[Future, Any]]
+    """
     future_to_kwargs = dict()
-    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        logger.info("launching ProcessPoolExecutor...")
         for f in flist:
             kwargs = dict(
                 raster_filename=str(f),
                 boundary=boundary_df,
-                strict=True,
-                classify_voids=True,
-                env_options=DEFAULT_ENV_OPTIONS,
+                **void_options,
+                env_options=env_options,
             )
             future_to_kwargs[executor.submit(get_raster_properties, **kwargs)] = kwargs
 
         results = []
         failed_futures = []
         logger.info("processing %s futures", len(future_to_kwargs))
-        for future in tqdm(as_completed(future_to_kwargs.keys())):
+        for future in tqdm(
+            as_completed(future_to_kwargs.keys()), total=len(future_to_kwargs.keys())
+        ):
             try:
                 results.append(future.result())
             except Exception as e:
@@ -293,8 +318,12 @@ def main():
 
         # retry failed futures up to N times
         retry_count = 0
-        while retry_count < MAX_RETRY_FAILED_FUTURES and failed_futures:
-            logger.info("retrying %s failed futures, attempt %s", len(failed_futures), retry_count)
+        while retry_count < max_retries and failed_futures:
+            logger.info(
+                "retrying %s failed futures, attempt %s",
+                len(failed_futures),
+                retry_count,
+            )
             _futures = []
             for f in failed_futures:
                 kwargs = future_to_kwargs[f]
@@ -309,24 +338,59 @@ def main():
                     logger.error("%s raised an exception: %s", future, e)
                     failed_futures.append(future)
             retry_count += 1
+    return (results, failed_futures, future_to_kwargs)
 
-        # log filename for failed and full exceptions
-        if failed_futures:
-            logger.info("failed futures: %s", failed_futures)
-            rows = []
-            exceptions = []
-            for future in failed_futures:
-                kwargs = future_to_kwargs[future]
-                raster_filename = kwargs.get("raster_filename")
-                rows.append((raster_filename,))
-                exceptions.extend(traceback.format_exception(future.exception()))
-            failed = pd.DataFrame(rows, columns=["path"])
-            failed.to_csv("failed.csv", index=False)
-            with open("exceptions.txt", "w") as f:
-                f.writelines(exceptions)
 
-    df = pd.DataFrame(results)
-    df.to_csv("out.csv", index=False)
+@timeit
+def main():
+    MAX_RETRY_FAILED_FUTURES = 3  # maximum number of retries for failed futures
+    MAX_WORKERS = (
+        os.cpu_count()
+        # 1  # numbers of workers to use for parallel processing, default is number of CPU cores.
+    )
+    OUTPUT_DIR = Path(".")  # output directory for csv files
+    DEFAULT_ENV_OPTIONS = {
+        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",  # avoid reading all files in directory looking for external .ovr files
+        "GDAL_PAM_ENABLED": "NO",  # avoid writing *.aux.xml files which might cache incorrect stats
+        # default is 5% of physical memory. Since rasterize is memory intensive increasing this value can help.
+        # See notes in https://rasterio.readthedocs.io/en/stable/api/rasterio.features.html#rasterio.features.rasterize
+        # Value must be integer number of bytes.
+        # Example showcases 25% of 8GB converted to bytes
+        # "GDAL_CACHEMAX": int(0.25 * (8 * 1e9))
+    }
+    MAX_ITEMS = 100  # short-circuit for testing
+
+    data_root = Path("./data/17811_US_LP_2024_Enbridge_test")
+    boundary_file = next(data_root.rglob("*Boundary*.geojson"))
+    boundary_df = gpd.read_file(boundary_file)
+    flist = list_files(data_root, extensions=["tif", "tiff"])
+    if MAX_ITEMS:
+        flist = flist[:MAX_ITEMS]
+
+    # work
+    void_options = dict(
+        strict=False,
+        void_threshold=0.01,
+        classify_voids=True,
+        geom_buffer_size=1,
+    )
+    results, failed_futures, future_to_kwargs = process_rasters(
+        flist=flist,
+        boundary_df=boundary_df,
+        max_workers=MAX_WORKERS,
+        max_retries=MAX_RETRY_FAILED_FUTURES,
+        env_options=DEFAULT_ENV_OPTIONS,
+        void_options=void_options,
+    )
+
+    # write results, failed, and exceptions
+    write_report(
+        OUTPUT_DIR.joinpath("report.csv"),
+        results,
+    )
+
+    write_failed(OUTPUT_DIR.joinpath("failed.csv"), failed_futures, future_to_kwargs)
+    dump_exceptions(OUTPUT_DIR.joinpath("exceptions.txt"), failed_futures)
 
 
 if __name__ == "__main__":

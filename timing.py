@@ -11,6 +11,6 @@ def timeit(func):
         result = func(*args, **kwargs)
         end = time.perf_counter()
         msg = f'{func.__name__} took {end - start} seconds'
-        logger.info(msg)
+        logger.debug(msg)
         return result
     return wrapper
